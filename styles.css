@@ -37,7 +37,7 @@ html.rot-r #app { top: 0; left: 100vw; transform: rotate(90deg); }
 html.rot-l, html.rot-r { --safe-t: 12px; --safe-b: 6px; }
 
 /* ---------- Header ---------- */
-#top { position: relative; padding: calc(var(--safe-t) + 14px) 16px 0; text-align: center; flex: none; overflow: hidden; }
+#top { position: relative; padding: calc(var(--safe-t) + 26px) 16px 0; text-align: center; flex: none; overflow: hidden; }
 .brand { display: flex; align-items: center; justify-content: center; gap: 10px; }
 .brand h1 { margin: 0; font: 900 30px/1 var(--sign-font); letter-spacing: .32em; padding-left: .32em; }
 .star { width: 18px; height: 18px; background: var(--star); display: inline-block;
