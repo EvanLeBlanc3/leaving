@@ -1,5 +1,5 @@
 /* Leaving service worker — offline shell + push notifications */
-const CACHE = 'leaving-v1.0.0';
+const CACHE = 'leaving-v1.1.0';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
@@ -12,7 +12,6 @@ self.addEventListener('activate', e => {
 });
 
 // Network-first for the app itself (so GitHub updates show up), cache fallback when offline.
-// Live CTA data is never cached here.
 self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;

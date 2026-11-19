@@ -4,7 +4,7 @@
    ===================================================================== */
 'use strict';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -43,6 +43,7 @@ const QUIPS = {
   run:  ['RUN. Like the Bean is chasing you.', 'Sprint mode. (Please don’t hold the doors.)', 'Go go go! Pretend it’s the last Cubs W train.', 'Legs, don’t fail me now.'],
   gone: ['That one’s gone. Like a Bears lead.', 'Missed it. There’s always the next one.', 'It left without you. Rude.']
 };
+const FAV_ADD = ['★ Saved. It’s officially your stop now.', '★ Added. Dibs called.', '★ Favorited. Good taste, neighbor.'];
 
 /* ------------------------------- storage -------------------------------- */
 const store = {
@@ -54,18 +55,20 @@ const S = {
   settings: Object.assign({ server: '', apiKey: '', speed: 'walk', buffer: 1, defaultLead: 10, refresh: 10, chime: true }, store.get('lv_settings', {})),
   stations: [], byId: {},
   pos: null, posErr: null,
-  favs: store.get('lv_favs', []),
+  // Favorites: ordered list of station ids, oldest first → each new favorite lands underneath the previous ones
+  favs: [...new Set((store.get('lv_favs', []) || []).map(String))],
   alerts: store.get('lv_alerts', []).filter(a => !a.fired || Date.now() - a.createdAt < 6 * 3600e3),
   arr: {},
   tab: 'nearby', station: null, line: store.get('lv_line', 'Red'),
   query: '', showMore: false,
-  positions: null, routes: null, svc: null, linesAt: 0, metaAt: 0,
+  positions: null, routes: null, svc: null, metaAt: 0,
   lastOk: 0, lastErr: null,
-  sheet: null
+  sheet: null, vapid: null
 };
 const saveSettings = () => store.set('lv_settings', S.settings);
 const saveAlerts = () => store.set('lv_alerts', S.alerts);
 const saveFavs = () => store.set('lv_favs', S.favs);
+const isFav = id => S.favs.includes(String(id));
 const isSetup = () => !!(serverBase() || S.settings.apiKey.trim());
 const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 
@@ -76,9 +79,8 @@ function applyRotation() {
   const phone = Math.min(screen.width, screen.height) < 600;
   const land = window.innerWidth > window.innerHeight;
   if (!phone || !land) return;
-  let ang = typeof window.orientation === 'number' ? window.orientation
+  const ang = typeof window.orientation === 'number' ? window.orientation
     : (screen.orientation && typeof screen.orientation.angle === 'number' ? screen.orientation.angle : 90);
-  // 90 = phone turned counter-clockwise → spin content back the other way
   root.classList.add(ang === 90 || ang === -270 ? 'rot-l' : 'rot-r');
 }
 window.addEventListener('resize', applyRotation);
@@ -202,7 +204,7 @@ function buildStations(rows) {
   }
   return [...m.values()].map(s => ({ ...s, lines: LINE_ORDER.filter(l => s.lines.has(l)) }));
 }
-function buildStations2(rows) { // fallback dataset 3tzw-cg4m
+function buildStations2(rows) { // fallback dataset
   const names = { Red: /red/i, Blue: /blue/i, Brn: /brown/i, G: /green/i, Org: /orange/i, P: /purple/i, Pink: /pink/i, Y: /yellow/i };
   return (rows || []).map(r => {
     const g = r.the_geom && r.the_geom.coordinates;
@@ -247,7 +249,7 @@ function nearest(n) {
   return S.stations.map(s => ({ s, d: dist(o, s) })).sort((a, b) => a.d - b.d).slice(0, n).map(x => x.s);
 }
 function walkInfo(st) {
-  if (!S.pos || S.pos.fake || !st) return null;
+  if (!S.pos || S.pos.fake || !st || st.lat == null) return null;
   const d = dist(S.pos, st);
   const walkMin = (d * 1.25) / SPEEDS[S.settings.speed].mpm; // 1.25 = city grid detour factor
   const total = walkMin + Number(S.settings.buffer || 0);
@@ -292,11 +294,12 @@ function leaveState(leaveAt) {
   return { secs, cls: 'gone', label: 'Missed it' };
 }
 const mmss = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
-const pick = (arr, seed) => arr[Math.abs([...String(seed)].reduce((a, c) => a * 31 + c.charCodeAt(0), 7)) % arr.length];
+const pick = (list, seed) => list[Math.abs([...String(seed)].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7)) % list.length];
 
 /* ------------------------------ UI bits --------------------------------- */
 const bullet = rt => { const l = L(rt); return `<span class="bullet" style="background:${l.c};color:${l.t}">${esc(l.name)}</span>`; };
 const lineBars = lines => `<div class="linebars">${(lines.length ? lines : ['x']).map(k => `<i style="background:${L(k).c}"></i>`).join('')}</div>`;
+const favBtn = id => `<button class="fav ${isFav(id) ? 'on' : ''}" data-fav="${id}" aria-label="${isFav(id) ? 'Remove favorite' : 'Add favorite'}">${isFav(id) ? '★' : '☆'}</button>`;
 let toastT;
 function toast(msg, ms = 3800) {
   const t = $('#toast'); t.innerHTML = msg; t.hidden = false;
@@ -331,15 +334,10 @@ function skylineSVG() {
     for (let i = 0; i < 3; i++) if (rnd() > .55) parts.push(`<rect x="${(x + 2 + rnd() * (w - 4)).toFixed(1)}" y="${(H - h + 3 + rnd() * (h - 6)).toFixed(1)}" width="1.2" height="1.2" fill="#FFD15C" opacity=".5"/>`);
     x += w + 1;
   }
-  // Willis
   parts.push(`<rect x="118" y="${H - 28}" width="20" height="28" fill="${f}"/><rect x="121" y="${H - 34}" width="14" height="6" fill="${f}"/><rect x="124" y="${H - 37}" width="8" height="3" fill="${f}"/><rect x="125" y="${H - 40}" width="1" height="3" fill="${f}"/><rect x="130" y="${H - 40}" width="1" height="3" fill="${f}"/>`);
-  // Aon
   parts.push(`<rect x="160" y="${H - 29}" width="12" height="29" fill="${f}"/>`);
-  // Trump
   parts.push(`<rect x="204" y="${H - 26}" width="11" height="26" fill="${f}"/><rect x="206" y="${H - 31}" width="7" height="5" fill="${f}"/><rect x="207.5" y="${H - 34}" width="4" height="3" fill="${f}"/><rect x="209.2" y="${H - 40}" width=".7" height="6" fill="${f}"/>`);
-  // Hancock
   parts.push(`<polygon points="262,${H} 280,${H} 277,${H - 30} 265,${H - 30}" fill="${f}"/><rect x="267" y="${H - 38}" width="1" height="8" fill="${f}"/><rect x="274" y="${H - 38}" width="1" height="8" fill="${f}"/><circle cx="267.5" cy="${H - 38}" r=".8" fill="#E4002B"/><circle cx="274.5" cy="${H - 38}" r=".8" fill="#E4002B"/>`);
-  // L tracks + train
   const train = `<g><rect x="0" y="${H - 7}" width="12" height="4.5" rx="1" fill="#C9D3DE"/><rect x="13" y="${H - 7}" width="12" height="4.5" rx="1" fill="#C9D3DE"/><rect x="26" y="${H - 7}" width="12" height="4.5" rx="1" fill="#C9D3DE"/><rect x="0" y="${H - 4}" width="38" height=".8" fill="#C60C30"/>${[2, 6, 15, 19, 28, 32].map(wx => `<rect x="${wx}" y="${H - 6.2}" width="2.4" height="1.4" fill="#FFE9A8"/>`).join('')}<animateTransform attributeName="transform" type="translate" from="-45 0" to="${W + 10} 0" dur="16s" repeatCount="indefinite"/></g>`;
   const girders = Array.from({ length: 40 }, (_, i) => `<rect x="${i * 10}" y="${H - 2.4}" width="1" height="2.4" fill="#2B4060"/>`).join('');
   return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMax slice">${parts.join('')}<rect x="0" y="${H - 2.6}" width="${W}" height="1" fill="#2B4060"/>${girders}${train}</svg>`;
@@ -387,8 +385,8 @@ function fillNearby() {
     const o = origin();
     const hits = S.stations.filter(s => (s.name + ' ' + s.desc).toLowerCase().includes(q))
       .map(s => ({ s, d: dist(o, s) })).sort((a, b) => a.d - b.d).slice(0, 30);
-    el.innerHTML = `<div class="section-title">${hits.length} station${hits.length === 1 ? '' : 's'}</div>` + (hits.length ? `<div class="card">${hits.map(({ s, d }) =>
-      `<button class="trow" data-open="${s.mapid}"><div class="info"><div class="dest">${esc(s.name)}</div><div class="meta">${s.lines.map(bullet).join('')}${s.ada ? ' ♿' : ''}</div></div><div class="muted small">${S.pos && !S.pos.fake ? fmtDist(d) : ''}</div></button>`).join('')}</div>`
+    el.innerHTML = `<div class="section-title">${hits.length} station${hits.length === 1 ? '' : 's'}<span class="grow"></span><span style="letter-spacing:0;text-transform:none;font-weight:600">Tap ☆ to save</span></div>` + (hits.length ? `<div class="card">${hits.map(({ s, d }) =>
+      `<div class="trow"><button class="info" style="text-align:left" data-open="${s.mapid}"><div class="dest">${esc(s.name)}</div><div class="meta">${s.lines.map(bullet).join('')}${s.ada ? ' ♿' : ''}${S.pos && !S.pos.fake ? ` · ${fmtDist(d)}` : ''}</div></button>${favBtn(s.mapid)}</div>`).join('')}</div>`
       : `<div class="empty"><div class="e">🤔</div>No L station by that name. Did you mean “Clark/Lake”? (Everyone means Clark/Lake.)</div>`);
     return;
   }
@@ -397,12 +395,20 @@ function fillNearby() {
   if (!S.pos) h += `<div class="note">📡 Finding you… (Chicago is big.)</div>`;
   else if (S.pos.fake) h += `<div class="note warn">📍 Location is ${S.posErr === 'denied' ? 'off' : 'unavailable'} — pretending you’re standing at Clark/Lake. <button data-act="geo" style="color:var(--sky);font-weight:800">Try again</button></div>`;
 
-  const near = nearest(S.showMore ? 8 : 4);
-  h += heroHTML(near);
-  const favs = S.favs.map(id => S.byId[id]).filter(Boolean).filter(s => !near.includes(s));
-  if (favs.length) h += `<div class="section-title">★ Favorites</div>` + favs.map(stationCard).join('');
-  h += `<div class="section-title">Nearest stations<span class="grow"></span>${isSetup() ? liveHTML() : ''}</div>`;
-  h += near.map(stationCard).join('');
+  const nearAll = nearest(S.showMore ? 8 : 4);
+  h += heroHTML(nearAll);
+
+  // ★ Favorites — every saved station, in the order you added them (newest at the bottom)
+  const favs = S.favs.map(id => S.byId[id]).filter(Boolean);
+  if (favs.length) {
+    h += `<div class="section-title favt">★ My stations (${favs.length})<span class="grow"></span>${isSetup() ? liveHTML() : ''}</div>`;
+    h += favs.map(stationCard).join('');
+  }
+
+  const near = nearAll.filter(s => !isFav(s.mapid));
+  h += `<div class="section-title">Nearest stations<span class="grow"></span>${!favs.length && isSetup() ? liveHTML() : ''}</div>`;
+  h += near.map(stationCard).join('') || `<div class="note">All your closest stations are already favorites. Overachiever.</div>`;
+  if (!favs.length) h += `<div class="note">Tip: tap the ☆ on any station to pin it up top. Pin as many as you like — they stack in the order you add them.</div>`;
   h += `<button class="btn ghost" data-act="more">${S.showMore ? 'Show fewer' : 'Show more stations'}</button>`;
   el.innerHTML = h;
 }
@@ -445,7 +451,6 @@ function groupByDir(etas) {
 function stationCard(st) {
   const w = walkInfo(st);
   const d = S.arr[st.mapid];
-  const fav = S.favs.includes(st.mapid);
   let body = '';
   if (!isSetup()) body = '';
   else if (!d) body = `<div class="dirgroup"><div class="skeleton" style="height:52px;margin:0"></div></div>`;
@@ -454,10 +459,10 @@ function stationCard(st) {
     if (!etas.length) body = `<div class="dirgroup muted small">${d.err ? '⚠️ ' + esc(d.err) : 'No predictions right now. 😴'}</div>`;
     else body = groupByDir(etas).map(([k, list]) => `<div class="dirgroup"><h4>${esc(k)}</h4><div class="chips">${list.slice(0, 4).map(e => chipHTML(e, st, w)).join('')}</div></div>`).join('');
   }
-  return `<div class="card"><button class="sign" style="width:100%;text-align:left" data-open="${st.mapid}">
+  return `<div class="card ${isFav(st.mapid) ? 'isfav' : ''}" data-card="${st.mapid}"><button class="sign" style="width:100%;text-align:left;display:block" data-open="${st.mapid}">
       <div class="nm">${esc(st.name)}</div>
       <div class="sub"><span>${st.lines.map(k => L(k).name).join(' · ')}</span>${w ? `<span>🚶 ${fmtDist(w.d)} · ${w.far ? 'far, friend' : Math.max(1, Math.round(w.walkMin)) + ' min'}</span>` : ''}${st.ada ? '<span>♿</span>' : ''}</div>
-      ${fav ? '<span class="fav">★</span>' : ''}</button>${lineBars(st.lines)}${body}</div>`;
+    </button>${favBtn(st.mapid)}${lineBars(st.lines)}${body}</div>`;
 }
 function chipHTML(e, st, w) {
   const leave = w && w.ms != null ? `<div class="lv" data-leave="${e.at - w.ms}"></div>` : '';
@@ -471,10 +476,8 @@ function chipHTML(e, st, w) {
 function stationShell() {
   const st = S.byId[S.station] || { name: 'Station', desc: '', lines: [], mapid: S.station };
   const w = walkInfo(st);
-  const fav = S.favs.includes(st.mapid);
   return `<button class="back" data-act="back">‹ Back</button>
-  <div class="card"><div class="sign"><div class="nm">${esc(st.name)}</div><div class="sub"><span>${esc(st.desc)}</span></div>
-    <button class="fav" data-fav="${st.mapid}" aria-label="Favorite">${fav ? '★' : '☆'}</button></div>${lineBars(st.lines)}
+  <div class="card"><div class="sign"><div class="nm">${esc(st.name)}</div><div class="sub"><span>${esc(st.desc)}</span></div></div>${favBtn(st.mapid)}${lineBars(st.lines)}
     <div class="dirgroup small muted">${w ? (w.far ? `🚶 ${fmtDist(w.d)} away — that’s a hike. Maybe a bus? A bike? A pep talk?` : `🚶 ${fmtDist(w.d)} · ~${Math.max(1, Math.round(w.walkMin))} min walk at ${SPEEDS[S.settings.speed].label} pace + ${S.settings.buffer} min buffer`) : '📍 Walk time shows once we know where you are.'}${st.ada ? ' · ♿ Accessible' : ''}</div></div>
   <div class="section-title">Arrivals<span class="grow"></span>${liveHTML()}</div><div id="stationDyn"><div class="skeleton"></div></div>`;
 }
@@ -532,7 +535,7 @@ function fillLines() {
 /* -------------------------------- Alerts -------------------------------- */
 function notifState() {
   if (!('Notification' in window)) return 'unsupported';
-  return Notification.permission; // default | granted | denied
+  return Notification.permission;
 }
 function fillAlerts() {
   const el = $('#alertsDyn'); if (!el) return;
@@ -549,13 +552,10 @@ function fillAlerts() {
     <div class="row" style="margin-top:10px;gap:8px">${ns === 'default' ? '<button class="btn" data-act="enable">Enable</button>' : ''}${serverBase() && ns === 'granted' ? '<button class="btn ghost" data-act="testpush">Send test push</button>' : ''}</div></div></div>`;
   h += `<div class="section-title">Active alerts (${active.length})</div>`;
   if (!active.length) h += `<div class="card empty"><div class="e">🔕</div>No alerts yet.<br>Tap any train, pick how many minutes of warning you want, and we’ll nag you. Lovingly.</div>`;
-  else h += `<div class="card">${active.map(a => {
-    const st = S.byId[a.mapid];
-    return `<div class="arow">${bullet(a.rt)}<div class="grow"><div style="font-weight:800">to ${esc(a.destNm)} · Run ${esc(a.rn)}</div>
+  else h += `<div class="card">${active.map(a => `<div class="arow">${bullet(a.rt)}<div class="grow"><div style="font-weight:800">to ${esc(a.destNm)} · Run ${esc(a.rn)}</div>
       <div class="muted small">${esc(a.staNm)} · ping ${a.lead} min before · ${a.at ? `train in <span data-at="${a.at}"></span>` : 'waiting for prediction'}</div>
       <div class="small" style="color:${a.serverId ? 'var(--good)' : 'var(--warn)'}">${a.serverId ? '☁️ Push — works with app closed' : '📱 In-app only — keep Leaving open'}</div></div>
-      <button class="x" data-act="del" data-id="${a.id}" aria-label="Delete">✕</button></div>`;
-  }).join('')}</div>`;
+      <button class="x" data-act="del" data-id="${a.id}" aria-label="Delete">✕</button></div>`).join('')}</div>`;
   if (done.length) h += `<div class="section-title">Recently sent<span class="grow"></span><button data-act="clearDone" style="color:var(--sky);font-size:12px;letter-spacing:0">Clear</button></div><div class="card">${done.map(a =>
     `<div class="arow" style="opacity:.6">${bullet(a.rt)}<div class="grow"><div style="font-weight:700">to ${esc(a.destNm)} · ${esc(a.staNm)}</div><div class="muted small">${a.lead} min warning · sent ✓</div></div></div>`).join('')}</div>`;
   el.innerHTML = h;
@@ -673,6 +673,33 @@ async function openFollowSheet(rn, rt) {
   }
 }
 
+/* ------------------------------ Favorites ------------------------------- */
+function toggleFav(id, btn) {
+  id = String(id);
+  const adding = !isFav(id);
+  // Append to the END so each new favorite stacks underneath the ones already saved
+  S.favs = adding ? [...S.favs.filter(x => x !== id), id] : S.favs.filter(x => x !== id);
+  saveFavs();
+  const name = (S.byId[id] && S.byId[id].name) || 'Station';
+  toast(adding ? `${pick(FAV_ADD, id)}<br><span class="muted small">${esc(name)} is #${S.favs.length} in My stations.</span>` : `☆ ${esc(name)} removed from My stations.`);
+
+  // Re-draw the current screen so the station moves into (or out of) the favorites list immediately
+  const v = $('#view'); const scroll = v.scrollTop;
+  if (S.station) {
+    $$('[data-fav]').forEach(b => { b.outerHTML = favBtn(b.dataset.fav); });
+  } else if (S.tab === 'nearby') {
+    fillNearby();
+    v.scrollTop = scroll;
+    if (adding && !S.query.trim()) {
+      const card = $(`#nearbyDyn [data-card="${id}"]`);
+      if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+    refreshNow();
+  }
+  const nb = $(`[data-fav="${id}"]`);
+  if (nb) nb.classList.add('pop');
+}
+
 /* ------------------------------ Push + alerts --------------------------- */
 const b64uToBytes = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return Uint8Array.from(atob(s), c => c.charCodeAt(0)); };
 const bytesToB64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -689,7 +716,7 @@ async function loadVapid() {
 }
 async function ensurePush() {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) throw new Error(isStandalone() ? 'Push not supported on this device' : 'Add Leaving to your Home Screen to get push alerts');
-  await ensurePermission(); // must be the first await so iOS sees the tap
+  await ensurePermission(); // first await, so iOS still sees the tap
   const reg = await navigator.serviceWorker.ready;
   const publicKey = S.vapid || await loadVapid();
   if (!publicKey) throw new Error('Server didn’t return a push key (is LEAVING_KV bound?)');
@@ -702,8 +729,6 @@ async function ensurePush() {
 async function setAlertFromSheet() {
   const { eta, mapid, lead } = S.sheet;
   const st = S.byId[mapid] || { name: eta.staNm };
-  // replace an existing alert for the same train/station
-  // kick off the permission/push request FIRST, while we're still inside the tap (iOS is picky)
   const pushP = serverBase() ? ensurePush() : ensurePermission();
   pushP.catch(() => {});
   const old = S.alerts.find(a => !a.fired && a.mapid === mapid && a.rn === eta.rn);
@@ -725,7 +750,6 @@ async function setAlertFromSheet() {
   }
   S.alerts.push(a); saveAlerts();
   closeSheet(); toast(msg, 5000); updateDynamic();
-  if (a.at && Date.now() >= a.at - lead * 60000 && !a.serverId) checkLocalAlerts();
 }
 async function deleteAlert(id, quiet) {
   const a = S.alerts.find(x => x.id === id);
@@ -808,9 +832,12 @@ function wantedStations() {
   const add = id => { if (id && !ids.includes(id)) ids.push(id); };
   if (S.station) add(S.station);
   if (S.sheet && S.sheet.mapid) add(S.sheet.mapid);
-  if (!S.station && S.tab === 'nearby' && S.pos) { nearest(S.showMore ? 8 : 4).forEach(s => add(s.mapid)); S.favs.forEach(add); }
+  if (!S.station && S.tab === 'nearby') {
+    S.favs.forEach(add);                                  // favorites first — always live
+    if (S.pos) nearest(S.showMore ? 8 : 4).forEach(s => add(s.mapid));
+  }
   S.alerts.filter(a => !a.fired).forEach(a => add(a.mapid));
-  return ids.slice(0, 12);
+  return ids.slice(0, 20);
 }
 async function poll() {
   if (polling) return;
@@ -837,9 +864,11 @@ document.addEventListener('pointerdown', unlockAudio, { passive: true });
 $('#sheetBg').addEventListener('click', closeSheet);
 
 document.addEventListener('click', async ev => {
-  const t = ev.target.closest('[data-tab],[data-open],[data-train],[data-ftrain],[data-follow],[data-line],[data-fav],[data-lead],[data-set],[data-act]');
+  // data-fav is checked first so tapping the star never also opens the station
+  const t = ev.target.closest('[data-fav],[data-tab],[data-open],[data-train],[data-ftrain],[data-follow],[data-line],[data-lead],[data-set],[data-act]');
   if (!t) return;
   const ds = t.dataset;
+  if (ds.fav) { ev.stopPropagation(); return toggleFav(ds.fav, t); }
   if (ds.tab) return go(ds.tab);
   if (ds.ftrain != null && S.sheet && S.sheet.etas) {
     const e = S.sheet.etas[+ds.ftrain];
@@ -855,13 +884,6 @@ document.addEventListener('click', async ev => {
   if (ds.follow) return openFollowSheet(ds.follow, ds.rt);
   if (ds.open) return openStation(ds.open);
   if (ds.line) { S.line = ds.line; store.set('lv_line', ds.line); $$('.linepick button').forEach(b => b.classList.toggle('on', b.dataset.line === ds.line)); fillLines(); return; }
-  if (ds.fav) {
-    const id = ds.fav;
-    S.favs = S.favs.includes(id) ? S.favs.filter(x => x !== id) : [...S.favs, id];
-    saveFavs(); t.textContent = S.favs.includes(id) ? '★' : '☆';
-    toast(S.favs.includes(id) ? '★ Added to favorites. Good taste.' : 'Removed from favorites.');
-    return;
-  }
   if (ds.lead && S.sheet) { S.sheet.lead = Math.max(1, Math.min(120, +ds.lead)); renderTrainSheet(); return; }
   if (ds.set) {
     let v = ds.val; if (v === 'true') v = true; else if (v === 'false') v = false; else if (!isNaN(+v)) v = +v;
