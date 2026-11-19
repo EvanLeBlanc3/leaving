@@ -4,7 +4,7 @@
    ===================================================================== */
 'use strict';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -63,7 +63,8 @@ const S = {
   query: '', showMore: false,
   positions: null, routes: null, svc: null, metaAt: 0,
   lastOk: 0, lastErr: null,
-  sheet: null, vapid: null
+  sheet: null, vapid: null,
+  bus: { routes: null, rq: '', rt: null, dirs: null, dir: null, stops: null, sq: '', stop: null, prd: null, err: null }
 };
 const saveSettings = () => store.set('lv_settings', S.settings);
 const saveAlerts = () => store.set('lv_alerts', S.alerts);
@@ -350,16 +351,22 @@ function render() {
   if (S.station) v.innerHTML = stationShell();
   else if (S.tab === 'nearby') v.innerHTML = nearbyShell();
   else if (S.tab === 'lines') v.innerHTML = linesShell();
+  else if (S.tab === 'bus') v.innerHTML = busShell();
   else if (S.tab === 'alerts') v.innerHTML = `<div id="alertsDyn"></div>`;
   else v.innerHTML = settingsHTML();
   const q = $('#q');
   if (q) q.addEventListener('input', () => { S.query = q.value; fillNearby(); });
+  const bq = $('#bq');
+  if (bq) bq.addEventListener('input', () => { S.bus.rq = bq.value; fillBus(); });
+  const sq = $('#sq');
+  if (sq) sq.addEventListener('input', () => { S.bus.sq = sq.value; fillBus(); });
   updateDynamic();
 }
 function updateDynamic() {
   if (S.station) fillStation();
   else if (S.tab === 'nearby') fillNearby();
   else if (S.tab === 'lines') fillLines();
+  else if (S.tab === 'bus') fillBus();
   else if (S.tab === 'alerts') fillAlerts();
   if (S.sheet && S.sheet.type === 'train') refreshTrainSheetData();
   updateBadge();
@@ -598,7 +605,7 @@ function settingsHTML() {
     <div class="row" style="margin-top:10px"><button class="btn ghost" data-act="saveKey">Save key</button></div></div>
     <div class="field"><div class="row" style="gap:8px"><button class="btn ghost" data-act="reloadStations">Refresh station list</button><button class="btn ghost" data-act="reset">Reset app</button></div></div>
   </div>
-  <div class="empty small">Leaving v${VERSION} · Data from CTA Train Tracker &amp; City of Chicago Data Portal.<br>Not affiliated with the CTA. Predictions are estimates — the L does what it wants.</div>`;
+  <div class="empty small">Leaving v${VERSION} · Data from CTA Train Tracker, Bus Tracker &amp; City of Chicago Data Portal.<br>Not affiliated with the CTA. Predictions are estimates — the L does what it wants.</div>`;
 }
 
 /* -------------------------------- Sheets -------------------------------- */
@@ -796,6 +803,222 @@ async function fireLocal(a) {
   }
 }
 
+
+/* ================================= BUS ================================== */
+const BUS_POPULAR = ['22', '9', '66', '8', '49', '77', '79', '151', '36', '147'];
+const BT = s => { const m = /^(\d{4})(\d\d)(\d\d) (\d\d):(\d\d)(?::(\d\d))?/.exec(s || ''); return m ? Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) : NaN; };
+const bclock = s => { const m = / (\d\d):(\d\d)/.exec(s || ''); if (!m) return ''; let h = +m[1]; const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return `${h}:${m[2]} ${ap}`; };
+const routeSort = (a, b) => (parseInt(a.rt, 10) || 9999) - (parseInt(b.rt, 10) || 9999) || a.rt.localeCompare(b.rt);
+const busRoute = rt => (S.bus.routes || []).find(r => r.rt === rt) || { rt, nm: '', c: '#1F4E8C' };
+function textOn(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || ''); if (!m) return '#fff';
+  const n = parseInt(m[1], 16), lum = (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return lum > 0.62 ? '#111' : '#fff';
+}
+function busColor(c) { return /^#[0-9a-f]{6}$/i.test(c || '') && c.toLowerCase() !== '#ffffff' ? c : '#1F4E8C'; }
+
+async function busGet(path, params = {}) {
+  if (!serverBase()) throw new Error('Add your Leaving server in Settings to use buses');
+  const qs = new URLSearchParams(params).toString();
+  const j = await getJSON(`${serverBase()}${path}${qs ? '?' + qs : ''}`);
+  const b = (j && j['bustime-response']) || {};
+  const e = arr(b.error)[0];
+  return { b, err: e ? (e.msg || 'Bus Tracker error') : null };
+}
+
+async function busLoadRoutes(force) {
+  const B = S.bus;
+  if (B.routes && !force) return;
+  const cached = store.get('lv_busroutes', null);
+  if (!force && cached && cached.list && cached.list.length && Date.now() - cached.ts < 7 * 864e5) { B.routes = cached.list; return; }
+  try {
+    const { b, err } = await busGet('/bus/routes');
+    if (err) throw new Error(err);
+    B.routes = arr(b.routes).map(r => ({ rt: String(r.rt), nm: r.rtnm, c: busColor(r.rtclr) })).sort(routeSort);
+    if (B.routes.length) store.set('lv_busroutes', { ts: Date.now(), list: B.routes });
+    B.err = null;
+  } catch (e) { B.err = e.message; }
+}
+async function busPickRoute(rt) {
+  const B = S.bus;
+  Object.assign(B, { rt, dirs: null, dir: null, stops: null, stop: null, prd: null, sq: '', err: null });
+  render(); $('#view').scrollTop = 0;
+  try {
+    const { b, err } = await busGet('/bus/directions', { rt });
+    if (err) throw new Error(err);
+    if (B.rt !== rt) return;
+    B.dirs = arr(b.directions).map(d => d.id || d.dir || d.name).filter(Boolean);
+    if (!B.dirs.length) throw new Error('No directions found for this route');
+    await busPickDir(B.dirs[0], true);
+  } catch (e) { B.err = e.message; render(); }
+}
+async function busPickDir(dir, quiet) {
+  const B = S.bus, rt = B.rt;
+  Object.assign(B, { dir, stops: null, stop: null, prd: null, err: null });
+  if (!quiet) render(); else render();
+  try {
+    const { b, err } = await busGet('/bus/stops', { rt, dir });
+    if (err) throw new Error(err);
+    if (B.rt !== rt || B.dir !== dir) return;
+    B.stops = arr(b.stops).map(s => ({ stpid: String(s.stpid), nm: s.stpnm, lat: +s.lat, lon: +s.lon }));
+  } catch (e) { B.err = e.message; }
+  if (S.tab === 'bus') fillBus();
+}
+function busPickStop(stpid) {
+  const B = S.bus;
+  B.stop = (B.stops || []).find(s => s.stpid === stpid) || null;
+  B.prd = null; B.prdErr = null;
+  render(); $('#view').scrollTop = 0; refreshNow();
+}
+async function fetchBusPredictions() {
+  const B = S.bus; if (!B.stop) return;
+  const stpid = B.stop.stpid;
+  try {
+    const { b, err } = await busGet('/bus/predictions', { stpid, rt: B.rt });
+    if (B.stop?.stpid !== stpid) return;
+    const now = Date.now();
+    if (err && !/no arrival|no service/i.test(err)) throw new Error(err);
+    B.prd = arr(b.prd).map(p => ({
+      vid: String(p.vid), rt: String(p.rt), des: p.des, dir: p.rtdir,
+      at: now + (BT(p.prdtm) - BT(p.tmstmp)), clock: bclock(p.prdtm),
+      dly: p.dly === true || p.dly === 'true', ft: +p.dstp || 0
+    })).filter(p => !isNaN(p.at)).sort((a, b2) => a.at - b2.at);
+    B.prdNote = err || null; B.prdErr = null;
+    S.lastOk = now; S.lastErr = null;
+  } catch (e) { B.prdErr = e.message; S.lastErr = e.message; if (!B.prd) B.prd = []; }
+}
+
+/* ---- Bus visuals ---- */
+function busSVG(c = '#1F4E8C') {
+  return `<svg class="bussvg" viewBox="0 0 120 54" aria-hidden="true">
+    <rect x="2" y="4" width="114" height="40" rx="8" fill="#F4F6F8"/>
+    <rect x="2" y="30" width="114" height="6" fill="${c}"/>
+    <rect x="2" y="36" width="114" height="3" fill="#E4002B"/>
+    <rect x="100" y="9" width="13" height="19" rx="3" fill="#2A3E57"/>
+    ${[8, 26, 44, 62, 80].map(x => `<rect x="${x}" y="9" width="15" height="13" rx="2" fill="#2A3E57"/>`).join('')}
+    <rect x="98" y="9" width="2" height="27" fill="#C9D3DE"/>
+    <rect x="6" y="6" width="22" height="2.5" rx="1" fill="#FFB800"/>
+    <circle cx="26" cy="44" r="7.5" fill="#1B1F24"/><circle cx="26" cy="44" r="3" fill="#9AA6B2"/>
+    <circle cx="94" cy="44" r="7.5" fill="#1B1F24"/><circle cx="94" cy="44" r="3" fill="#9AA6B2"/>
+    <rect x="113" y="31" width="4" height="4" rx="1" fill="#FFE9A8"/>
+  </svg>`;
+}
+function routeBanner(r) {
+  const c = busColor(r.c), tc = textOn(c);
+  return `<div class="rbanner" style="--rc:${c}">
+    <div class="rnum" style="color:${c}">${esc(r.rt)}</div>
+    <div class="grow"><div class="rname">${esc(r.nm || 'Route ' + r.rt)}</div>
+      <div class="rsub">${S.bus.dir ? esc(S.bus.dir) : 'Choose a direction'}</div></div>
+    <div class="rbus">${busSVG(c)}</div>
+    <div class="road"><i></i></div></div>`;
+}
+
+/* ---- Bus shell + fill ---- */
+function busShell() {
+  const B = S.bus;
+  if (!B.rt) {
+    return `<div class="bushero"><div class="bh-txt"><div class="kicker">CTA Bus Tracker</div><div class="bh-title">Where to, Chicago?</div><div class="bh-sub">Pick a route, a direction and your stop. We’ll tell you when to start walking.</div></div>${busSVG()}<div class="road"><i></i></div></div>
+      <div class="search"><span>🔎</span><input id="bq" type="search" placeholder="Route number or name (22, Clark…)" value="${esc(B.rq)}" autocomplete="off" inputmode="search"></div>
+      <div id="busDyn"></div>`;
+  }
+  const r = busRoute(B.rt);
+  let h = `<button class="back" data-act="${B.stop ? 'busBackStops' : 'busBackRoutes'}">‹ ${B.stop ? 'All stops' : 'All routes'}</button>` + routeBanner(r);
+  if (B.stop) {
+    const w = walkInfo(B.stop);
+    h += `<div class="stopsign"><div class="ss-top"><span class="ss-cta">cta</span><span class="ss-lbl">BUS STOP</span><span class="ss-id">#${esc(B.stop.stpid)}</span></div>
+      <div class="ss-body"><div class="ss-rt" style="background:${busColor(r.c)};color:${textOn(busColor(r.c))}">${esc(r.rt)}</div>
+      <div class="grow"><div class="ss-nm">${esc(B.stop.nm)}</div><div class="ss-dir">${esc(B.dir || '')} · ${esc(r.nm)}</div></div></div>
+      <div class="ss-walk">${w ? (w.far ? `🚶 ${fmtDist(w.d)} away — that’s a hike. Maybe a Divvy?` : `🚶 ${fmtDist(w.d)} · ~${Math.max(1, Math.round(w.walkMin))} min walk + ${S.settings.buffer} min buffer`) : '📍 Walk time shows once we know where you are.'}</div></div>
+      <div class="section-title">Arrivals<span class="grow"></span>${liveHTML()}</div><div id="busDyn"></div>`;
+    return h;
+  }
+  h += B.dirs ? `<div class="seg dirseg">${B.dirs.map(d => `<button data-bdir="${esc(d)}" class="${d === B.dir ? 'on' : ''}">${dirArrow(d)} ${esc(d)}</button>`).join('')}</div>`
+              : `<div class="skeleton" style="height:42px"></div>`;
+  h += `<div class="search" style="margin-top:12px"><span>🔎</span><input id="sq" type="search" placeholder="Filter stops (e.g. Belmont)" value="${esc(B.sq)}" autocomplete="off"></div><div id="busDyn"></div>`;
+  return h;
+}
+const dirArrow = d => /north/i.test(d) ? '↑' : /south/i.test(d) ? '↓' : /east/i.test(d) ? '→' : /west/i.test(d) ? '←' : '•';
+
+function fillBus() {
+  const el = $('#busDyn'); if (!el) return;
+  const B = S.bus;
+  if (!serverBase()) { el.innerHTML = '<div style="height:12px"></div>' + setupCard(); return; }
+  if (B.err && (/BUS_KEY/.test(B.err))) {
+    el.innerHTML = `<div class="card" style="padding:16px;margin-top:12px"><div style="font-weight:800;font-size:16px;margin-bottom:6px">🔑 Bus key needed</div><div class="muted small" style="line-height:1.5">Your server doesn’t have a Bus Tracker key yet. In Cloudflare, open your Worker → <b>Settings → Variables and Secrets → Add</b>, type <b>Secret</b>, name <b>BUS_KEY</b>, paste your Bus Tracker key, and deploy.</div><button class="btn" style="margin-top:12px" data-act="busRetry">Try again</button></div>`;
+    return;
+  }
+  if (B.err) { el.innerHTML = `<div class="card empty" style="margin-top:12px"><div class="e">🚧</div>${esc(B.err)}<br><button class="btn ghost" style="margin-top:12px" data-act="busRetry">Try again</button></div>`; return; }
+
+  // Step 1: routes
+  if (!B.rt) {
+    if (!B.routes) { el.innerHTML = `<div class="section-title">Loading routes…</div><div class="skeleton"></div><div class="skeleton"></div>`; return; }
+    const q = B.rq.trim().toLowerCase();
+    const list = q ? B.routes.filter(r => r.rt.toLowerCase().startsWith(q) || r.nm.toLowerCase().includes(q)) : B.routes;
+    let h = '';
+    if (!q) {
+      const pop = BUS_POPULAR.map(busRoute).filter(r => r.nm);
+      if (pop.length) h += `<div class="section-title">Chicago classics</div><div class="popgrid">${pop.map(r => `<button class="popchip" data-brt="${esc(r.rt)}" style="--rc:${busColor(r.c)}"><b style="background:${busColor(r.c)};color:${textOn(busColor(r.c))}">${esc(r.rt)}</b><span>${esc(r.nm)}</span></button>`).join('')}</div>`;
+    }
+    h += `<div class="section-title">${q ? `${list.length} match${list.length === 1 ? '' : 'es'}` : `All routes (${list.length})`}</div>`;
+    h += list.length ? `<div class="card">${list.map(r => `<button class="rrow" data-brt="${esc(r.rt)}"><span class="rbadge" style="background:${busColor(r.c)};color:${textOn(busColor(r.c))}">${esc(r.rt)}</span><span class="grow rrnm">${esc(r.nm)}</span><span class="chev">›</span></button>`).join('')}</div>`
+      : `<div class="empty"><div class="e">🤷</div>No route like that. The #1 Bus to Narnia was discontinued.</div>`;
+    el.innerHTML = h; return;
+  }
+
+  // Step 2: stops
+  if (!B.stop) {
+    if (!B.stops) { el.innerHTML = `<div class="skeleton" style="margin-top:12px"></div><div class="skeleton"></div>`; return; }
+    const real = S.pos && !S.pos.fake;
+    const q = B.sq.trim().toLowerCase();
+    let list = B.stops.map((s, i) => ({ s, i, d: real ? dist(S.pos, s) : null }));
+    const closest = real ? [...list].sort((a, b) => a.d - b.d)[0] : null;
+    if (q) list = list.filter(x => x.s.nm.toLowerCase().includes(q));
+    let h = '';
+    if (closest && !q) {
+      const w = walkInfo(closest.s);
+      h += `<button class="closest" data-bstop="${closest.s.stpid}"><div class="kicker">📍 Your closest ${esc(B.dir)} stop</div><div class="cl-nm">${esc(closest.s.nm)}</div><div class="cl-sub">${w ? (w.far ? fmtDist(w.d) + ' away' : `${fmtDist(w.d)} · ~${Math.max(1, Math.round(w.walkMin))} min walk`) : ''} · Tap for arrivals ›</div></button>`;
+    }
+    h += `<div class="section-title">${q ? `${list.length} stop${list.length === 1 ? '' : 's'}` : `Stops ${real ? 'nearest first' : 'along the route'} (${list.length})`}</div>`;
+    if (real && !q) list.sort((a, b) => a.d - b.d);
+    const c = busColor(busRoute(B.rt).c);
+    h += list.length ? `<div class="card stoplist" style="--rc:${c}">${list.map(({ s, d }) => {
+      const w = real ? walkInfo(s) : null;
+      return `<button class="srow" data-bstop="${s.stpid}"><span class="sdot"></span><div class="grow"><div class="dest">${esc(s.nm)}</div><div class="meta">${w ? (w.far ? fmtDist(d) : `🚶 ${fmtDist(d)} · ${Math.max(1, Math.round(w.walkMin))} min`) : `Stop #${esc(s.stpid)}`}</div></div><span class="chev">›</span></button>`;
+    }).join('')}</div>` : `<div class="empty"><div class="e">🔍</div>No stop matches “${esc(B.sq)}”.</div>`;
+    el.innerHTML = h; return;
+  }
+
+  // Step 3: arrivals
+  if (!B.prd) { el.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`; return; }
+  const w = walkInfo(B.stop);
+  const walking = w && w.ms != null;
+  const r = busRoute(B.rt), c = busColor(r.c);
+  const upcoming = B.prd.filter(p => p.at > Date.now() - 30000);
+  let h = '';
+  const best = upcoming.find(p => (walking ? p.at - w.ms : p.at) > Date.now() - 20000);
+  if (best) {
+    const target = walking ? best.at - w.ms : best.at;
+    h += `<div class="hero bus" id="hero" data-target="${target}" data-walk="${walking ? 1 : 0}" data-rn="${best.vid}">
+      <div class="kicker">${walking ? 'You need to leave in' : 'Next bus arrives in'}</div>
+      <div class="big"><span id="heroBig">--:--</span></div>
+      <div class="what"><span class="bullet" style="background:${c};color:${textOn(c)}">${esc(best.rt)}</span> to ${esc(best.des)}</div>
+      <div class="quip" id="heroQuip">${walking ? `~${Math.round(w.walkMin)} min walk + ${S.settings.buffer} min buffer · bus at ${best.clock}` : `Arrives ${best.clock}`}</div>
+      <div class="bar"><i id="heroBar" style="width:100%"></i></div></div>`;
+  }
+  if (!upcoming.length) {
+    h += `<div class="card empty"><div class="e">🌙</div>${B.prdErr ? '⚠️ ' + esc(B.prdErr) : 'No buses predicted for this stop right now.<br>Either service is done for the night or the bus is fashionably late.'}</div>`;
+  } else {
+    h += `<div class="section-title">Upcoming buses (${upcoming.length})</div><div class="card">${upcoming.map((p, i) => `<div class="brow" style="--rc:${c}">
+        <div class="bmins"><div class="n" data-at="${p.at}"></div></div>
+        <div class="info"><div class="dest">to ${esc(p.des)}</div>
+          <div class="meta">${p.clock} · Bus #${esc(p.vid)}${p.ft ? ` · ${fmtDist(p.ft / 3.281)} away` : ''}${p.dly ? ' <span class="pill dly">Delayed</span>' : ''}${i === 0 ? ' <span class="pill app">Next</span>' : ''}</div>
+          ${walking ? `<div class="lv" data-leave="${p.at - w.ms}"></div>` : ''}</div>
+        <div class="miniBus">${busSVG(c)}</div></div>`).join('')}</div>`;
+  }
+  h += `<div class="note">Bus Tracker updates roughly every 30 seconds from each bus’s GPS. Predictions are estimates — Lake Shore traffic does what it wants.</div>`;
+  el.innerHTML = h;
+}
+
 /* -------------------------------- Ticker -------------------------------- */
 function tick() {
   const now = Date.now();
@@ -846,6 +1069,7 @@ async function poll() {
     if (!document.hidden && isSetup()) {
       const jobs = wantedStations().map(fetchArrivals);
       if (S.tab === 'lines' && !S.station) jobs.push(fetchLines());
+      if (S.tab === 'bus' && S.bus.stop) jobs.push(fetchBusPredictions());
       await Promise.all(jobs);
       updateDynamic();
     }
@@ -857,7 +1081,11 @@ async function poll() {
 function refreshNow() { clearTimeout(pollT); if (!polling) poll(); else setTimeout(refreshNow, 400); }
 
 /* -------------------------------- Events -------------------------------- */
-function go(tab) { S.tab = tab; S.station = null; closeSheet(); render(); $('#view').scrollTop = 0; refreshNow(); if (tab === 'alerts') syncServerAlerts(); }
+function go(tab) {
+  S.tab = tab; S.station = null; closeSheet(); render(); $('#view').scrollTop = 0; refreshNow();
+  if (tab === 'alerts') syncServerAlerts();
+  if (tab === 'bus' && !S.bus.routes && serverBase()) busLoadRoutes().then(() => { if (S.tab === 'bus') fillBus(); });
+}
 function openStation(id) { S.station = id; closeSheet(); render(); $('#view').scrollTop = 0; refreshNow(); }
 
 document.addEventListener('pointerdown', unlockAudio, { passive: true });
@@ -865,9 +1093,12 @@ $('#sheetBg').addEventListener('click', closeSheet);
 
 document.addEventListener('click', async ev => {
   // data-fav is checked first so tapping the star never also opens the station
-  const t = ev.target.closest('[data-fav],[data-tab],[data-open],[data-train],[data-ftrain],[data-follow],[data-line],[data-lead],[data-set],[data-act]');
+  const t = ev.target.closest('[data-brt],[data-bdir],[data-bstop],[data-fav],[data-tab],[data-open],[data-train],[data-ftrain],[data-follow],[data-line],[data-lead],[data-set],[data-act]');
   if (!t) return;
   const ds = t.dataset;
+  if (ds.brt) return busPickRoute(ds.brt);
+  if (ds.bdir) return busPickDir(ds.bdir);
+  if (ds.bstop) return busPickStop(ds.bstop);
   if (ds.fav) { ev.stopPropagation(); return toggleFav(ds.fav, t); }
   if (ds.tab) return go(ds.tab);
   if (ds.ftrain != null && S.sheet && S.sheet.etas) {
@@ -894,6 +1125,13 @@ document.addEventListener('click', async ev => {
   }
   switch (ds.act) {
     case 'back': S.station = null; render(); refreshNow(); break;
+    case 'busBackRoutes': Object.assign(S.bus, { rt: null, dirs: null, dir: null, stops: null, stop: null, prd: null, err: null }); render(); break;
+    case 'busBackStops': S.bus.stop = null; S.bus.prd = null; render(); break;
+    case 'busRetry': {
+      const B = S.bus; B.err = null;
+      if (B.rt) busPickRoute(B.rt); else { render(); busLoadRoutes(true).then(() => { if (S.tab === 'bus') fillBus(); }); }
+      break;
+    }
     case 'more': S.showMore = !S.showMore; fillNearby(); refreshNow(); break;
     case 'geo': startGeo(); toast('📡 Asking your phone where you are…'); break;
     case 'leadUp': S.sheet.lead = Math.min(120, S.sheet.lead + 1); renderTrainSheet(); break;
@@ -921,8 +1159,8 @@ document.addEventListener('click', async ev => {
       out.textContent = 'Testing…';
       try {
         const h = await getJSON(val + '/health');
-        out.innerHTML = h.ok ? `✅ Connected. CTA key: ${h.hasKey ? '✅' : '❌ missing (add CTA_KEY secret)'} · Alert storage: ${h.hasKV ? '✅' : '❌ missing (bind LEAVING_KV)'}` : '⚠️ Unexpected reply';
-        S.vapid = null; loadVapid(); loadStations(); refreshNow();
+        out.innerHTML = h.ok ? `✅ Connected. CTA key: ${h.hasKey ? '✅' : '❌ missing (add CTA_KEY secret)'} · Bus key: ${h.hasBusKey ? '✅' : '❌ missing (add BUS_KEY secret)'} · Alert storage: ${h.hasKV ? '✅' : '❌ missing (bind LEAVING_KV)'}` : '⚠️ Unexpected reply';
+        S.vapid = null; loadVapid(); loadStations(); refreshNow(); S.bus.routes = null; S.bus.err = null;
       } catch (e) { out.textContent = '❌ ' + e.message + ' — double-check the URL.'; }
       break;
     }
