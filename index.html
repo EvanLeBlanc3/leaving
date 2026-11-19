@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Leaving">
+  <meta name="theme-color" content="#0B1A2E">
+  <meta name="format-detection" content="telephone=no">
+  <title>Leaving</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header id="top">
+      <div class="brand">
+        <span class="star" aria-hidden="true"></span>
+        <h1>LEAVING</h1>
+        <span class="star" aria-hidden="true"></span>
+      </div>
+      <div id="tagline">Chicago’s most punctual anxiety</div>
+      <div id="skyline" aria-hidden="true"></div>
+      <div class="stripes" aria-hidden="true"><i></i><i></i></div>
+    </header>
+
+    <main id="view"></main>
+
+    <nav id="tabs">
+      <button data-tab="nearby" class="on"><span class="ti">📍</span><span>Nearby</span></button>
+      <button data-tab="lines"><span class="ti">🚇</span><span>Lines</span></button>
+      <button data-tab="alerts"><span class="ti">🔔</span><span>Alerts</span><b id="alertBadge" hidden></b></button>
+      <button data-tab="settings"><span class="ti">⚙️</span><span>Settings</span></button>
+    </nav>
+
+    <div id="sheetWrap" hidden>
+      <div id="sheetBg"></div>
+      <div id="sheet" role="dialog" aria-modal="true"></div>
+    </div>
+    <div id="toast" hidden></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
